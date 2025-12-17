@@ -6,3 +6,9 @@ scikit-learn
 jupyter
 notebook
 joblib
+scikit-learn>=1.2
+pandas
+numpy
+joblib
+mlflow
+pytest
