@@ -1,68 +1,82 @@
 import pandas as pd
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.impute import SimpleImputer
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 
-from features import (
-    AggregateTransactionFeatures,
-    DateTimeFeatures,
-    WoETransformer
-)
+BASE_DIR = Path(__file__).resolve().parents[1]
+RAW_DATA = BASE_DIR / "data" / "raw" / "data.csv"
+PROCESSED_DIR = BASE_DIR / "data" / "processed"
+PROCESSED_DIR.mkdir(exist_ok=True, parents=True)
 
-# -------------------------------
-# Load Data
-# -------------------------------
-DATA_PATH = "data/raw/data.csv"
-OUTPUT_PATH = "data/processed/features.csv"
-TARGET = "FraudResult"
+OUTPUT_FILE = PROCESSED_DIR / "data_with_proxy_target.csv"
 
-df = pd.read_csv(DATA_PATH)
 
-X = df.drop(columns=[TARGET])
-y = df[TARGET]
+def load_data():
+    df = pd.read_csv(RAW_DATA)
+    df["TransactionStartTime"] = pd.to_datetime(df["TransactionStartTime"])
+    return df
 
-# Identify columns
-categorical_cols = X.select_dtypes(include="object").columns.tolist()
-numerical_cols = X.select_dtypes(exclude="object").columns.tolist()
 
-# -------------------------------
-# Pipelines
-# -------------------------------
-numeric_pipeline = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="median")),
-    ("scaler", StandardScaler())
-])
+def compute_rfm(df):
+    snapshot_date = df["TransactionStartTime"].max() + pd.Timedelta(days=1)
 
-categorical_pipeline = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="most_frequent")),
-    ("encoder", OneHotEncoder(handle_unknown="ignore"))
-])
+    rfm = (
+        df.groupby("CustomerId")
+        .agg(
+            Recency=("TransactionStartTime", lambda x: (snapshot_date - x.max()).days),
+            Frequency=("TransactionId", "count"),
+            Monetary=("Amount", "sum"),
+        )
+        .reset_index()
+    )
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ("num", numeric_pipeline, numerical_cols),
-        ("cat", categorical_pipeline, categorical_cols),
-    ]
-)
+    return rfm
 
-# -------------------------------
-# Full Feature Engineering Pipeline
-# -------------------------------
-pipeline = Pipeline(steps=[
-    ("aggregates", AggregateTransactionFeatures()),
-    ("datetime", DateTimeFeatures()),
-    ("preprocessing", preprocessor),
-])
 
-from scipy import sparse
+def cluster_customers(rfm):
+    scaler = StandardScaler()
+    rfm_scaled = scaler.fit_transform(
+        rfm[["Recency", "Frequency", "Monetary"]]
+    )
 
-X_processed = pipeline.fit_transform(X)
+    kmeans = KMeans(n_clusters=3, random_state=42)
+    rfm["cluster"] = kmeans.fit_predict(rfm_scaled)
 
-# Save sparse matrix correctly
-sparse.save_npz("data/processed/features_sparse.npz", X_processed)
+    return rfm
 
-# Save target separately
-y.to_csv("data/processed/target.csv", index=False)
 
-print("✅ Feature engineering completed. Sparse features saved.")
+def assign_high_risk(rfm):
+    cluster_summary = (
+        rfm.groupby("cluster")[["Recency", "Frequency", "Monetary"]]
+        .mean()
+    )
+
+    # Least engaged cluster = low frequency & low monetary
+    high_risk_cluster = (
+        cluster_summary
+        .sort_values(by=["Frequency", "Monetary"], ascending=True)
+        .index[0]
+    )
+
+    rfm["is_high_risk"] = (rfm["cluster"] == high_risk_cluster).astype(int)
+
+    return rfm[["CustomerId", "is_high_risk"]]
+
+
+def main():
+    df = load_data()
+    rfm = compute_rfm(df)
+    rfm = cluster_customers(rfm)
+    risk_labels = assign_high_risk(rfm)
+
+    df_final = df.merge(risk_labels, on="CustomerId", how="left")
+
+    df_final.to_csv(OUTPUT_FILE, index=False)
+
+    print("✅ Task 4 completed successfully")
+    print("High-risk distribution:")
+    print(df_final["is_high_risk"].value_counts())
+
+
+if __name__ == "__main__":
+    main()
